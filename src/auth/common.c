@@ -30,20 +30,28 @@ int security_handshake_failed(struct nvnc_client* client, const char* username,
 		nvnc_log(NVNC_LOG_INFO, "Security handshake failed: %s",
 				reason_string);
 
-	char buffer[256];
+	if (client->rfb_minor_version == 3) {
+		/* RFB 3.3: SecurityResult is uint32 only, no reason string */
+		uint32_t result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
+		stream_write(client->net_stream, &result, sizeof(result),
+				close_after_write, client->net_stream);
+	} else {
+		char buffer[256];
 
-	uint32_t* result = (uint32_t*)buffer;
+		uint32_t* result = (uint32_t*)buffer;
 
-	struct rfb_error_reason* reason =
-	        (struct rfb_error_reason*)(buffer + sizeof(*result));
+		struct rfb_error_reason* reason =
+			(struct rfb_error_reason*)(buffer + sizeof(*result));
 
-	*result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
-	reason->length = htonl(strlen(reason_string));
-	strcpy(reason->message, reason_string);
+		*result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
+		reason->length = htonl(strlen(reason_string));
+		strcpy(reason->message, reason_string);
 
-	size_t len = sizeof(*result) + sizeof(*reason) + strlen(reason_string);
-	stream_write(client->net_stream, buffer, len, close_after_write,
-			client->net_stream);
+		size_t len = sizeof(*result) + sizeof(*reason) +
+			strlen(reason_string);
+		stream_write(client->net_stream, buffer, len,
+				close_after_write, client->net_stream);
+	}
 
 	stream_ref(client->net_stream);
 

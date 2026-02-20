@@ -55,6 +55,7 @@ enum nvnc_client_state {
 	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_SUBTYPE,
 	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH,
 #endif
+	VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE,
 #ifdef HAVE_CRYPTO
 	VNC_CLIENT_STATE_WAITING_FOR_APPLE_DH_RESPONSE,
 	VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_PUBLIC_KEY,
@@ -143,6 +144,10 @@ struct nvnc_client {
 	bool has_ext_mouse_buttons;
 	struct aml_idle* close_task;
 
+	uint8_t rfb_minor_version; /* Client's RFB minor version (3, 7, or 8) */
+
+	uint8_t vnc_auth_challenge[16];
+
 #ifdef HAVE_CRYPTO
 	struct crypto_key* apple_dh_secret;
 
@@ -203,6 +208,8 @@ struct nvnc {
 	enum nvnc_auth_flags auth_flags;
 	nvnc_auth_fn auth_fn;
 	void* auth_ud;
+
+	char vnc_auth_password[9]; /* VNC Auth (type 2) password, max 8 chars + NUL */
 
 #ifdef ENABLE_TLS
 	gnutls_certificate_credentials_t tls_creds;

@@ -31,6 +31,7 @@
 #include "cursor.h"
 #include "logging.h"
 #include "auth/auth.h"
+#include "auth/vnc-auth.h"
 #include "bandwidth.h"
 #include "compositor.h"
 
@@ -287,6 +288,11 @@ static void init_security_types(struct nvnc* server)
 			ADD_SECURITY_TYPE(RFB_SECURITY_TYPE_APPLE_DH);
 		}
 #endif
+
+		if (server->vnc_auth_password[0] != '\0' &&
+		    !(server->auth_flags & NVNC_AUTH_REQUIRE_ENCRYPTION)) {
+			ADD_SECURITY_TYPE(RFB_SECURITY_TYPE_VNC_AUTH);
+		}
 	} else {
 		ADD_SECURITY_TYPE(RFB_SECURITY_TYPE_NONE);
 	}
@@ -331,27 +337,81 @@ static int on_version_message(struct nvnc_client* client)
 	memcpy(version_string, client->msg_buffer + client->buffer_index, 12);
 	version_string[12] = '\0';
 
-	if (strcmp(RFB_VERSION_MESSAGE, version_string) != 0)
+	/* Parse version: "RFB 003.00X\n" */
+	int major = 0, minor = 0;
+	if (sscanf(version_string, "RFB %03d.%03d", &major, &minor) != 2 ||
+	    major != 3 || (minor != 3 && minor != 7 && minor != 8))
 		return handle_unsupported_version(client);
 
-	uint8_t buf[sizeof(struct rfb_security_types_msg) +
-		MAX_SECURITY_TYPES] = {};
-	struct rfb_security_types_msg* security =
-		(struct rfb_security_types_msg*)buf;
+	client->rfb_minor_version = minor;
+	nvnc_log(NVNC_LOG_DEBUG, "Client RFB version: 3.%d", minor);
 
 	init_security_types(server);
-
-	security->n = server->n_security_types;
-	for (int i = 0; i < server->n_security_types; ++i) {
-		security->types[i] = server->security_types[i];
-	}
-
 	update_min_rtt(client);
 
-	stream_write(client->net_stream, security, sizeof(*security) +
-			security->n, NULL, NULL);
+	if (minor == 3) {
+		/* RFB 3.3: Server sends a single uint32 security type.
+		 * Only None and VNC Auth are valid for 3.3. */
+		enum rfb_security_type chosen = RFB_SECURITY_TYPE_INVALID;
 
-	client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
+		for (int i = 0; i < server->n_security_types; ++i) {
+			if (server->security_types[i] ==
+			    RFB_SECURITY_TYPE_VNC_AUTH) {
+				chosen = RFB_SECURITY_TYPE_VNC_AUTH;
+				break;
+			}
+			if (server->security_types[i] ==
+			    RFB_SECURITY_TYPE_NONE &&
+			    chosen == RFB_SECURITY_TYPE_INVALID) {
+				chosen = RFB_SECURITY_TYPE_NONE;
+			}
+		}
+
+		if (chosen == RFB_SECURITY_TYPE_INVALID) {
+			nvnc_log(NVNC_LOG_WARNING,
+				"No security type compatible with RFB 3.3");
+			uint32_t zero = htonl(0);
+			stream_write(client->net_stream, &zero,
+					sizeof(zero), close_after_write,
+					client->net_stream);
+			stream_ref(client->net_stream);
+			client_close(client);
+			return -1;
+		}
+
+		uint32_t type_net = htonl((uint32_t)chosen);
+		stream_write(client->net_stream, &type_net, sizeof(type_net),
+				NULL, NULL);
+
+		nvnc_log(NVNC_LOG_DEBUG,
+			"RFB 3.3: Server chose security type %d", chosen);
+
+		if (chosen == RFB_SECURITY_TYPE_NONE) {
+			/* RFB 3.3 + None: no SecurityResult, straight to init */
+			client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+		} else if (chosen == RFB_SECURITY_TYPE_VNC_AUTH) {
+			vnc_auth_send_challenge(client);
+			client->state =
+				VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE;
+		}
+	} else {
+		/* RFB 3.7/3.8: Server sends count + list of types */
+		uint8_t buf[sizeof(struct rfb_security_types_msg) +
+			MAX_SECURITY_TYPES] = {};
+		struct rfb_security_types_msg* security =
+			(struct rfb_security_types_msg*)buf;
+
+		security->n = server->n_security_types;
+		for (int i = 0; i < server->n_security_types; ++i) {
+			security->types[i] = server->security_types[i];
+		}
+
+		stream_write(client->net_stream, security, sizeof(*security) +
+				security->n, NULL, NULL);
+
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
+	}
+
 	return 12;
 }
 
@@ -374,6 +434,10 @@ static int on_security_message(struct nvnc_client* client)
 	case RFB_SECURITY_TYPE_NONE:
 		security_handshake_ok(client, NULL);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+		break;
+	case RFB_SECURITY_TYPE_VNC_AUTH:
+		vnc_auth_send_challenge(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE;
 		break;
 #ifdef ENABLE_TLS
 	case RFB_SECURITY_TYPE_VENCRYPT:
@@ -1988,6 +2052,8 @@ static int try_read_client_message(struct nvnc_client* client)
 		return on_version_message(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_SECURITY:
 		return on_security_message(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE:
+		return vnc_auth_handle_response(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_INIT:
 		return on_init_message(client);
 #ifdef ENABLE_TLS
@@ -3019,13 +3085,14 @@ EXPORT
 int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
 		nvnc_auth_fn auth_fn, void* userdata)
 {
-#if defined(ENABLE_TLS) || defined(HAVE_CRYPTO)
+#if !defined(ENABLE_TLS) && !defined(HAVE_CRYPTO)
+	if (self->vnc_auth_password[0] == '\0')
+		return -1;
+#endif
 	self->auth_flags = flags;
 	self->auth_fn = auth_fn;
 	self->auth_ud = userdata;
 	return 0;
-#endif
-	return -1;
 }
 
 static bool buffers_are_equal(struct nvnc_fb* a, struct nvnc_fb* b)
@@ -3105,6 +3172,18 @@ int nvnc_set_rsa_creds(struct nvnc* self, const char* path)
 	return ok ? 0 : -1;
 #endif
 	return -1;
+}
+
+EXPORT
+int nvnc_set_vnc_auth_password(struct nvnc* self, const char* password)
+{
+	if (!password || password[0] == '\0')
+		return -1;
+
+	strncpy(self->vnc_auth_password, password,
+			sizeof(self->vnc_auth_password) - 1);
+	self->vnc_auth_password[sizeof(self->vnc_auth_password) - 1] = '\0';
+	return 0;
 }
 
 static uint32_t find_highest_client_depth(const struct nvnc* self)
