@@ -1,0 +1,500 @@
+From 0b616255cbb5816528a50797d516f52a6b74e4b4 Mon Sep 17 00:00:00 2001
+From: Alistair Reay <5599065+alistairreay@users.noreply.github.com>
+Date: Fri, 20 Feb 2026 15:43:39 +0000
+Subject: [PATCH] Add VNC Authentication (type 2) and RFB 3.3 support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement legacy VNC Authentication (security type 2) using DES
+challenge-response for compatibility with clients like macOS Screen
+Sharing that don't support VeNCrypt/RSA-AES.
+
+Key changes:
+- Add VNC Auth with DES challenge-response (nettle) in auth/vnc-auth.c
+- Support RFB 3.3/3.7/3.8 version negotiation in on_version_message()
+- RFB 3.3: server sends single uint32 security type (not count+list)
+- RFB 3.3: SecurityResult has no reason string on failure
+- Fix CPIXEL calculation to follow RFB spec (use pixel format conditions
+  instead of depth field) — fixes ZRLE corruption with depth=32 clients
+- Expose nvnc_set_vnc_auth_password() public API
+---
+ include/auth/vnc-auth.h |  22 ++++++++
+ include/common.h        |   7 +++
+ include/neatvnc.h       |   1 +
+ meson.build             |   1 +
+ src/auth/common.c       |  28 ++++++----
+ src/auth/vnc-auth.c     | 105 +++++++++++++++++++++++++++++++++++++
+ src/enc/util.c          |  15 +++++-
+ src/pixels.c            |   4 +-
+ src/server.c            | 113 ++++++++++++++++++++++++++++++++++------
+ 9 files changed, 265 insertions(+), 31 deletions(-)
+ create mode 100644 include/auth/vnc-auth.h
+ create mode 100644 src/auth/vnc-auth.c
+
+diff --git a/include/auth/vnc-auth.h b/include/auth/vnc-auth.h
+new file mode 100644
+index 0000000..a29623c
+--- /dev/null
++++ b/include/auth/vnc-auth.h
+@@ -0,0 +1,22 @@
++/*
++ * Copyright (c) 2024 wayvnc contributors
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
++ * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
++ * AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
++ * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
++ * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
++ * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
++ * PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#pragma once
++
++struct nvnc_client;
++
++int vnc_auth_send_challenge(struct nvnc_client* client);
++int vnc_auth_handle_response(struct nvnc_client* client);
+diff --git a/include/common.h b/include/common.h
+index 5519e11..d30d228 100644
+--- a/include/common.h
++++ b/include/common.h
+@@ -55,6 +55,7 @@ enum nvnc_client_state {
+ 	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_SUBTYPE,
+ 	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH,
+ #endif
++	VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE,
+ #ifdef HAVE_CRYPTO
+ 	VNC_CLIENT_STATE_WAITING_FOR_APPLE_DH_RESPONSE,
+ 	VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_PUBLIC_KEY,
+@@ -143,6 +144,10 @@ struct nvnc_client {
+ 	bool has_ext_mouse_buttons;
+ 	struct aml_idle* close_task;
+ 
++	uint8_t rfb_minor_version; /* Client's RFB minor version (3, 7, or 8) */
++
++	uint8_t vnc_auth_challenge[16];
++
+ #ifdef HAVE_CRYPTO
+ 	struct crypto_key* apple_dh_secret;
+ 
+@@ -204,6 +209,8 @@ struct nvnc {
+ 	nvnc_auth_fn auth_fn;
+ 	void* auth_ud;
+ 
++	char vnc_auth_password[9]; /* VNC Auth (type 2) password, max 8 chars + NUL */
++
+ #ifdef ENABLE_TLS
+ 	gnutls_certificate_credentials_t tls_creds;
+ #endif
+diff --git a/include/neatvnc.h b/include/neatvnc.h
+index cf032a3..3047182 100644
+--- a/include/neatvnc.h
++++ b/include/neatvnc.h
+@@ -209,6 +209,7 @@ int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
+ int nvnc_set_tls_creds(struct nvnc* self, const char* privkey_path,
+                      const char* cert_path);
+ int nvnc_set_rsa_creds(struct nvnc* self, const char* private_key_path);
++int nvnc_set_vnc_auth_password(struct nvnc* self, const char* password);
+ 
+ struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
+                             uint32_t fourcc_format, uint16_t stride);
+diff --git a/meson.build b/meson.build
+index 4cecebe..60910e5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -172,6 +172,7 @@ if nettle.found() and hogweed.found() and gmp.found()
+ 		'src/stream/rsa-aes.c',
+ 		'src/auth/apple-dh.c',
+ 		'src/auth/rsa-aes.c',
++		'src/auth/vnc-auth.c',
+ 	]
+ 	if not(have_random)
+ 		error('No random generator available')
+diff --git a/src/auth/common.c b/src/auth/common.c
+index 9781c3e..1b09216 100644
+--- a/src/auth/common.c
++++ b/src/auth/common.c
+@@ -30,20 +30,28 @@ int security_handshake_failed(struct nvnc_client* client, const char* username,
+ 		nvnc_log(NVNC_LOG_INFO, "Security handshake failed: %s",
+ 				reason_string);
+ 
+-	char buffer[256];
++	if (client->rfb_minor_version == 3) {
++		/* RFB 3.3: SecurityResult is uint32 only, no reason string */
++		uint32_t result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
++		stream_write(client->net_stream, &result, sizeof(result),
++				close_after_write, client->net_stream);
++	} else {
++		char buffer[256];
+ 
+-	uint32_t* result = (uint32_t*)buffer;
++		uint32_t* result = (uint32_t*)buffer;
+ 
+-	struct rfb_error_reason* reason =
+-	        (struct rfb_error_reason*)(buffer + sizeof(*result));
++		struct rfb_error_reason* reason =
++			(struct rfb_error_reason*)(buffer + sizeof(*result));
+ 
+-	*result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
+-	reason->length = htonl(strlen(reason_string));
+-	strcpy(reason->message, reason_string);
++		*result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
++		reason->length = htonl(strlen(reason_string));
++		strcpy(reason->message, reason_string);
+ 
+-	size_t len = sizeof(*result) + sizeof(*reason) + strlen(reason_string);
+-	stream_write(client->net_stream, buffer, len, close_after_write,
+-			client->net_stream);
++		size_t len = sizeof(*result) + sizeof(*reason) +
++			strlen(reason_string);
++		stream_write(client->net_stream, buffer, len,
++				close_after_write, client->net_stream);
++	}
+ 
+ 	stream_ref(client->net_stream);
+ 
+diff --git a/src/auth/vnc-auth.c b/src/auth/vnc-auth.c
+new file mode 100644
+index 0000000..d58da4e
+--- /dev/null
++++ b/src/auth/vnc-auth.c
+@@ -0,0 +1,105 @@
++/*
++ * Copyright (c) 2024 wayvnc contributors
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
++ * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
++ * AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
++ * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
++ * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
++ * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
++ * PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * VNC Authentication (RFB security type 2)
++ *
++ * This implements the legacy DES challenge-response authentication used by
++ * macOS Screen Sharing and many other VNC clients.
++ *
++ * Protocol:
++ *   1. Server generates 16 random bytes (challenge) and sends to client
++ *   2. Client encrypts the challenge using DES with the password as key
++ *   3. Server does the same encryption and compares results
++ *
++ * VNC DES quirk: each byte of the password has its bits reversed before
++ * being used as the DES key. This is a well-known VNC protocol oddity.
++ */
++
++#include "auth/vnc-auth.h"
++#include "auth/auth.h"
++#include "crypto.h"
++#include "stream/stream.h"
++#include "common.h"
++#include "neatvnc.h"
++
++#include <string.h>
++#include <nettle/des.h>
++
++#define VNC_AUTH_CHALLENGE_LEN 16
++
++static uint8_t reverse_bits(uint8_t b)
++{
++	b = ((b & 0xf0) >> 4) | ((b & 0x0f) << 4);
++	b = ((b & 0xcc) >> 2) | ((b & 0x33) << 2);
++	b = ((b & 0xaa) >> 1) | ((b & 0x55) << 1);
++	return b;
++}
++
++static void vnc_des_encrypt(uint8_t* dst, const uint8_t* challenge,
++		const char* password)
++{
++	/* Build the 8-byte DES key from the password, bit-reversed */
++	uint8_t key[8] = { 0 };
++	size_t pw_len = strlen(password);
++	if (pw_len > 8)
++		pw_len = 8;
++
++	for (size_t i = 0; i < pw_len; i++)
++		key[i] = reverse_bits((uint8_t)password[i]);
++
++	struct des_ctx ctx;
++	des_fix_parity(8, key, key);
++	des_set_key(&ctx, key);
++
++	/* Encrypt the 16-byte challenge as two 8-byte DES ECB blocks */
++	des_encrypt(&ctx, 8, dst, challenge);
++	des_encrypt(&ctx, 8, dst + 8, challenge + 8);
++}
++
++int vnc_auth_send_challenge(struct nvnc_client* client)
++{
++	crypto_random(client->vnc_auth_challenge, VNC_AUTH_CHALLENGE_LEN);
++
++	nvnc_log(NVNC_LOG_DEBUG, "Sending VNC Auth challenge");
++	return stream_write(client->net_stream, client->vnc_auth_challenge,
++			VNC_AUTH_CHALLENGE_LEN, NULL, NULL);
++}
++
++int vnc_auth_handle_response(struct nvnc_client* client)
++{
++	if (client->buffer_len - client->buffer_index < VNC_AUTH_CHALLENGE_LEN)
++		return 0;
++
++	const uint8_t* response = client->msg_buffer + client->buffer_index;
++
++	struct nvnc* server = client->server;
++
++	/* Compute expected response using the stored password */
++	uint8_t expected[VNC_AUTH_CHALLENGE_LEN];
++	vnc_des_encrypt(expected, client->vnc_auth_challenge,
++			server->vnc_auth_password);
++
++	if (memcmp(response, expected, VNC_AUTH_CHALLENGE_LEN) == 0) {
++		security_handshake_ok(client, NULL);
++		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
++	} else {
++		security_handshake_failed(client, NULL,
++				"VNC authentication failed");
++	}
++
++	return VNC_AUTH_CHALLENGE_LEN;
++}
+diff --git a/src/enc/util.c b/src/enc/util.c
+index 13c07ca..c9bf9e6 100644
+--- a/src/enc/util.c
++++ b/src/enc/util.c
+@@ -42,8 +42,19 @@ int nvnc__encode_rect_head(struct vec* dst, enum rfb_encodings encoding,
+ 
+ uint32_t nvnc__calc_bytes_per_cpixel(const struct rfb_pixel_format* fmt)
+ {
+-	return fmt->bits_per_pixel == 32 ? UDIV_UP(fmt->depth, 8)
+-	                                 : UDIV_UP(fmt->bits_per_pixel, 8);
++	/* RFB spec: CPIXEL is 3 bytes when bpp=32, true-colour, all
++	 * max values are 255, and all shifts are in {0, 8, 16}. */
++	if (fmt->bits_per_pixel == 32 &&
++	    fmt->true_colour_flag &&
++	    fmt->red_max == 255 &&
++	    fmt->green_max == 255 &&
++	    fmt->blue_max == 255 &&
++	    (fmt->red_shift % 8 == 0 && fmt->red_shift <= 16) &&
++	    (fmt->green_shift % 8 == 0 && fmt->green_shift <= 16) &&
++	    (fmt->blue_shift % 8 == 0 && fmt->blue_shift <= 16))
++		return 3;
++
++	return UDIV_UP(fmt->bits_per_pixel, 8);
+ }
+ 
+ uint32_t nvnc__calculate_region_area(struct pixman_region16* region)
+diff --git a/src/pixels.c b/src/pixels.c
+index cd72434..4e125ef 100644
+--- a/src/pixels.c
++++ b/src/pixels.c
+@@ -111,7 +111,7 @@ static void pixel32_to_cpixel(uint8_t* restrict dst,
+ 		}
+ 		break;
+ 	case 3:
+-		if (dst_fmt->bits_per_pixel == 32 && dst_fmt->depth <= 24) {
++		if (dst_fmt->bits_per_pixel == 32) {
+ 			uint32_t min_dst_shift = dst_red_shift;
+ 			if (min_dst_shift > dst_green_shift)
+ 				min_dst_shift = dst_green_shift;
+@@ -247,7 +247,7 @@ void pixel_to_cpixel(uint8_t* restrict dst,
+ 		}
+ 		break;
+ 	case 3:
+-		if (dst_fmt->bits_per_pixel == 32 && dst_fmt->depth <= 24) {
++		if (dst_fmt->bits_per_pixel == 32) {
+ 			uint32_t min_dst_shift = dst_red_shift;
+ 			if (min_dst_shift > dst_green_shift)
+ 				min_dst_shift = dst_green_shift;
+diff --git a/src/server.c b/src/server.c
+index fd92661..a929eb9 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -31,6 +31,7 @@
+ #include "cursor.h"
+ #include "logging.h"
+ #include "auth/auth.h"
++#include "auth/vnc-auth.h"
+ #include "bandwidth.h"
+ #include "compositor.h"
+ 
+@@ -287,6 +288,11 @@ static void init_security_types(struct nvnc* server)
+ 			ADD_SECURITY_TYPE(RFB_SECURITY_TYPE_APPLE_DH);
+ 		}
+ #endif
++
++		if (server->vnc_auth_password[0] != '\0' &&
++		    !(server->auth_flags & NVNC_AUTH_REQUIRE_ENCRYPTION)) {
++			ADD_SECURITY_TYPE(RFB_SECURITY_TYPE_VNC_AUTH);
++		}
+ 	} else {
+ 		ADD_SECURITY_TYPE(RFB_SECURITY_TYPE_NONE);
+ 	}
+@@ -331,27 +337,81 @@ static int on_version_message(struct nvnc_client* client)
+ 	memcpy(version_string, client->msg_buffer + client->buffer_index, 12);
+ 	version_string[12] = '\0';
+ 
+-	if (strcmp(RFB_VERSION_MESSAGE, version_string) != 0)
++	/* Parse version: "RFB 003.00X\n" */
++	int major = 0, minor = 0;
++	if (sscanf(version_string, "RFB %03d.%03d", &major, &minor) != 2 ||
++	    major != 3 || (minor != 3 && minor != 7 && minor != 8))
+ 		return handle_unsupported_version(client);
+ 
+-	uint8_t buf[sizeof(struct rfb_security_types_msg) +
+-		MAX_SECURITY_TYPES] = {};
+-	struct rfb_security_types_msg* security =
+-		(struct rfb_security_types_msg*)buf;
++	client->rfb_minor_version = minor;
++	nvnc_log(NVNC_LOG_DEBUG, "Client RFB version: 3.%d", minor);
+ 
+ 	init_security_types(server);
+-
+-	security->n = server->n_security_types;
+-	for (int i = 0; i < server->n_security_types; ++i) {
+-		security->types[i] = server->security_types[i];
+-	}
+-
+ 	update_min_rtt(client);
+ 
+-	stream_write(client->net_stream, security, sizeof(*security) +
+-			security->n, NULL, NULL);
++	if (minor == 3) {
++		/* RFB 3.3: Server sends a single uint32 security type.
++		 * Only None and VNC Auth are valid for 3.3. */
++		enum rfb_security_type chosen = RFB_SECURITY_TYPE_INVALID;
++
++		for (int i = 0; i < server->n_security_types; ++i) {
++			if (server->security_types[i] ==
++			    RFB_SECURITY_TYPE_VNC_AUTH) {
++				chosen = RFB_SECURITY_TYPE_VNC_AUTH;
++				break;
++			}
++			if (server->security_types[i] ==
++			    RFB_SECURITY_TYPE_NONE &&
++			    chosen == RFB_SECURITY_TYPE_INVALID) {
++				chosen = RFB_SECURITY_TYPE_NONE;
++			}
++		}
++
++		if (chosen == RFB_SECURITY_TYPE_INVALID) {
++			nvnc_log(NVNC_LOG_WARNING,
++				"No security type compatible with RFB 3.3");
++			uint32_t zero = htonl(0);
++			stream_write(client->net_stream, &zero,
++					sizeof(zero), close_after_write,
++					client->net_stream);
++			stream_ref(client->net_stream);
++			client_close(client);
++			return -1;
++		}
++
++		uint32_t type_net = htonl((uint32_t)chosen);
++		stream_write(client->net_stream, &type_net, sizeof(type_net),
++				NULL, NULL);
++
++		nvnc_log(NVNC_LOG_DEBUG,
++			"RFB 3.3: Server chose security type %d", chosen);
++
++		if (chosen == RFB_SECURITY_TYPE_NONE) {
++			/* RFB 3.3 + None: no SecurityResult, straight to init */
++			client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
++		} else if (chosen == RFB_SECURITY_TYPE_VNC_AUTH) {
++			vnc_auth_send_challenge(client);
++			client->state =
++				VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE;
++		}
++	} else {
++		/* RFB 3.7/3.8: Server sends count + list of types */
++		uint8_t buf[sizeof(struct rfb_security_types_msg) +
++			MAX_SECURITY_TYPES] = {};
++		struct rfb_security_types_msg* security =
++			(struct rfb_security_types_msg*)buf;
++
++		security->n = server->n_security_types;
++		for (int i = 0; i < server->n_security_types; ++i) {
++			security->types[i] = server->security_types[i];
++		}
++
++		stream_write(client->net_stream, security, sizeof(*security) +
++				security->n, NULL, NULL);
++
++		client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
++	}
+ 
+-	client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
+ 	return 12;
+ }
+ 
+@@ -375,6 +435,10 @@ static int on_security_message(struct nvnc_client* client)
+ 		security_handshake_ok(client, NULL);
+ 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+ 		break;
++	case RFB_SECURITY_TYPE_VNC_AUTH:
++		vnc_auth_send_challenge(client);
++		client->state = VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE;
++		break;
+ #ifdef ENABLE_TLS
+ 	case RFB_SECURITY_TYPE_VENCRYPT:
+ 		vencrypt_send_version(client);
+@@ -1988,6 +2052,8 @@ static int try_read_client_message(struct nvnc_client* client)
+ 		return on_version_message(client);
+ 	case VNC_CLIENT_STATE_WAITING_FOR_SECURITY:
+ 		return on_security_message(client);
++	case VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE:
++		return vnc_auth_handle_response(client);
+ 	case VNC_CLIENT_STATE_WAITING_FOR_INIT:
+ 		return on_init_message(client);
+ #ifdef ENABLE_TLS
+@@ -3019,13 +3085,14 @@ EXPORT
+ int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
+ 		nvnc_auth_fn auth_fn, void* userdata)
+ {
+-#if defined(ENABLE_TLS) || defined(HAVE_CRYPTO)
++#if !defined(ENABLE_TLS) && !defined(HAVE_CRYPTO)
++	if (self->vnc_auth_password[0] == '\0')
++		return -1;
++#endif
+ 	self->auth_flags = flags;
+ 	self->auth_fn = auth_fn;
+ 	self->auth_ud = userdata;
+ 	return 0;
+-#endif
+-	return -1;
+ }
+ 
+ static bool buffers_are_equal(struct nvnc_fb* a, struct nvnc_fb* b)
+@@ -3107,6 +3174,18 @@ int nvnc_set_rsa_creds(struct nvnc* self, const char* path)
+ 	return -1;
+ }
+ 
++EXPORT
++int nvnc_set_vnc_auth_password(struct nvnc* self, const char* password)
++{
++	if (!password || password[0] == '\0')
++		return -1;
++
++	strncpy(self->vnc_auth_password, password,
++			sizeof(self->vnc_auth_password) - 1);
++	self->vnc_auth_password[sizeof(self->vnc_auth_password) - 1] = '\0';
++	return 0;
++}
++
+ static uint32_t find_highest_client_depth(const struct nvnc* self)
+ {
+ 	int max_depth = 0;
+-- 
+2.53.0
+
