@@ -111,7 +111,7 @@ static void pixel32_to_cpixel(uint8_t* restrict dst,
 		}
 		break;
 	case 3:
-		if (dst_fmt->bits_per_pixel == 32 && dst_fmt->depth <= 24) {
+		if (dst_fmt->bits_per_pixel == 32) {
 			uint32_t min_dst_shift = dst_red_shift;
 			if (min_dst_shift > dst_green_shift)
 				min_dst_shift = dst_green_shift;
@@ -247,7 +247,7 @@ void pixel_to_cpixel(uint8_t* restrict dst,
 		}
 		break;
 	case 3:
-		if (dst_fmt->bits_per_pixel == 32 && dst_fmt->depth <= 24) {
+		if (dst_fmt->bits_per_pixel == 32) {
 			uint32_t min_dst_shift = dst_red_shift;
 			if (min_dst_shift > dst_green_shift)
 				min_dst_shift = dst_green_shift;

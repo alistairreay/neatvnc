@@ -42,8 +42,19 @@ int nvnc__encode_rect_head(struct vec* dst, enum rfb_encodings encoding,
 
 uint32_t nvnc__calc_bytes_per_cpixel(const struct rfb_pixel_format* fmt)
 {
-	return fmt->bits_per_pixel == 32 ? UDIV_UP(fmt->depth, 8)
-	                                 : UDIV_UP(fmt->bits_per_pixel, 8);
+	/* RFB spec: CPIXEL is 3 bytes when bpp=32, true-colour, all
+	 * max values are 255, and all shifts are in {0, 8, 16}. */
+	if (fmt->bits_per_pixel == 32 &&
+	    fmt->true_colour_flag &&
+	    fmt->red_max == 255 &&
+	    fmt->green_max == 255 &&
+	    fmt->blue_max == 255 &&
+	    (fmt->red_shift % 8 == 0 && fmt->red_shift <= 16) &&
+	    (fmt->green_shift % 8 == 0 && fmt->green_shift <= 16) &&
+	    (fmt->blue_shift % 8 == 0 && fmt->blue_shift <= 16))
+		return 3;
+
+	return UDIV_UP(fmt->bits_per_pixel, 8);
 }
 
 uint32_t nvnc__calculate_region_area(struct pixman_region16* region)
